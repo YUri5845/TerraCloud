@@ -41,8 +41,8 @@ async function sendInChunks(ws, buffer, chunkSize = 4096, delayMs = 10) {
     ws.send(chunk, { binary: true });
     await new Promise((r) => setTimeout(r, delayMs)); // give ESP32 time to flush
   }
-  ws.send("DONE"); // signal ESP that playback is complete
-  console.log("✅ Finished sending MP3 data");
+  ws.send(JSON.stringify({ type: "audio_end" }));
+console.log("✅ Finished sending MP3 data");
 }
 
 // === Text-to-Speech (TTS) ===
@@ -52,9 +52,9 @@ async function speak(ws, text) {
       model: "gpt-4o-mini-tts",
       voice: ws.assistantVoice || "alloy",
       input: text,
+      format: "mp3"
     });
     const buffer = Buffer.from(await ttsResponse.arrayBuffer());
-    ws.send("PROCESSING");
     await sendInChunks(ws, buffer);
   } catch (err) {
     console.error("❌ TTS error:", err);
@@ -222,3 +222,4 @@ wss.on("connection", (ws) => {
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
