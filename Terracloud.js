@@ -13,11 +13,9 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 10000;
 
-app.get("/", (req, res) => {
-  res.send("✅ TerraCloud WebSocket server is live!");
-});
+app.get("/", (req, res) => res.send("✅ TerraCloud WebSocket server is live!"));
 
-// Disable compression (important for binary audio)
+// Disable compression for reliable binary
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 console.log(`✅ WebSocket server initialized (port: ${PORT})`);
 
@@ -25,7 +23,7 @@ let conversation = [];
 const MAX_HISTORY = 5;
 const CONVO_FILE = "conversation.json";
 
-// Load previous messages
+// Load previous conversation
 if (fs.existsSync(CONVO_FILE)) {
   try {
     conversation = JSON.parse(fs.readFileSync(CONVO_FILE, "utf-8"));
@@ -35,66 +33,42 @@ if (fs.existsSync(CONVO_FILE)) {
   }
 }
 
-// === Reliable WebSocket Send Helper ===
+// === Helper to send safely ===
 function wsSendAsync(ws, data, options = {}) {
-  return new Promise((resolve, reject) => {
-    ws.send(data, options, (err) => {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
+  return new Promise((resolve, reject) => ws.send(data, options, err => err ? reject(err) : resolve()));
 }
 
-// === Send audio in chunks (safe + paced) ===
-async function sendInChunks(ws, buffer, chunkSize = 4096, delayMs = 15) {
-  console.log("🔊 Sending audio in chunks...");
-  let totalSent = 0;
-
-  for (let i = 0; i < buffer.length; i += chunkSize) {
-    const chunk = buffer.slice(i, i + chunkSize);
-    await wsSendAsync(ws, chunk, { binary: true });
-    totalSent += chunk.length;
-    await new Promise((r) => setTimeout(r, delayMs)); // allow ESP32 to flush
-  }
-
-  // Wait a bit before signaling end
-  await new Promise((r) => setTimeout(r, 100));
-  await wsSendAsync(ws, JSON.stringify({ type: "audio_end" }));
-
-  console.log(`✅ Finished sending MP3 data (Total: ${totalSent} bytes)`);
-}
-
-// === Text-to-Speech (TTS) ===
+// === Text-to-Speech (TTS) via URL mode ===
 async function speak(ws, text) {
   try {
+    // Generate TTS
     const ttsResponse = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: ws.assistantVoice || "alloy",
       input: text,
-      format: "mp3"
+      format: "url" // <-- use URL mode for reliable streaming
     });
 
-    const buffer = Buffer.from(await ttsResponse.arrayBuffer());
-    console.log(`🎵 Generated TTS audio (${buffer.length} bytes)`);
-
-    await sendInChunks(ws, buffer);
+    // Send the URL to ESP32 to download/play
+    const mp3Url = ttsResponse.url;
+    console.log(`🎵 TTS URL: ${mp3Url}`);
+    ws.send(JSON.stringify({ type: "tts_url", url: mp3Url }));
 
   } catch (err) {
     console.error("❌ TTS error:", err);
+    ws.send(JSON.stringify({ type: "error", msg: "TTS failed" }));
   }
 }
 
-// === News Fetcher ===
+// === News Fetcher (unchanged) ===
 async function getLatestNews(isTagalog = false, topic = "") {
   try {
     const key = process.env.NEWSDATA_API_KEY;
     if (!key) return "⚠️ Missing News API key in environment.";
     const base = `https://newsdata.io/api/1/news?country=ph&language=en&apikey=${key}`;
     const url = topic ? `${base}&q=${encodeURIComponent(topic)}` : base;
-
     const res = await fetch(url);
     const data = await res.json();
-
     if (data.status !== "success" || !data.results?.length)
       return isTagalog
         ? `⚠️ Walang balita tungkol sa ${topic || "Pilipinas"} ngayon.`
@@ -114,9 +88,7 @@ async function getLatestNews(isTagalog = false, topic = "") {
     });
 
     const text = summary.choices[0].message.content.trim();
-    return isTagalog
-      ? `📰 Narito ang mga pinakabagong balita: ${text}`
-      : `📰 Latest news: ${text}`;
+    return isTagalog ? `📰 Narito ang mga pinakabagong balita: ${text}` : `📰 Latest news: ${text}`;
   } catch (err) {
     console.error("📰 News error:", err);
     return "⚠️ Could not fetch news.";
@@ -133,16 +105,15 @@ wss.on("connection", (ws) => {
 
   ws.on("message", async (data, isBinary) => {
     try {
-      // === Binary (Audio Upload) ===
+      // --- Audio Upload (binary) ---
       if (isBinary) {
         if (writeStream) writeStream.write(data);
         return;
       }
 
-      // === Text Messages ===
+      // --- Text Messages ---
       const msg = data.toString();
 
-      // --- Config ---
       if (msg.startsWith("{\"cmd\":\"SET_CONFIG\"")) {
         const config = JSON.parse(msg);
         ws.assistantVoice = config.voice;
@@ -162,10 +133,8 @@ wss.on("connection", (ws) => {
         if (writeStream) writeStream.end();
         console.log("🎧 Audio upload complete");
 
-        // Tell ESP32 we’re processing
         ws.send("PROCESSING");
 
-        // === Transcribe audio ===
         const transcription = await openai.audio.transcriptions.create({
           file: fs.createReadStream("audio.wav"),
           model: "whisper-1",
@@ -176,7 +145,6 @@ wss.on("connection", (ws) => {
         let reply = "";
         const lower = userText.toLowerCase();
 
-        // --- Intent: Weather ---
         if (lower.includes("weather") || lower.includes("panahon")) {
           const match = lower.match(/(?:in|sa)\s+([a-zA-Z\s]+)/);
           const city = match ? match[1].trim() : "Manila";
@@ -194,18 +162,12 @@ wss.on("connection", (ws) => {
                 : `The weather in ${city} is ${desc} with ${temp}°C.`;
             } else reply = "⚠️ City not found.";
           }
-        }
-
-        // --- Intent: News ---
-        else if (lower.includes("news") || lower.includes("balita")) {
+        } else if (lower.includes("news") || lower.includes("balita")) {
           const isTagalog = lower.includes("balita");
           const topics = { tech: "technology", sports: "sports", business: "business", entertainment: "entertainment", politics: "politics" };
           const found = Object.entries(topics).find(([key, val]) => lower.includes(key) || lower.includes(val));
           reply = await getLatestNews(isTagalog, found ? found[1] : "");
-        }
-
-        // --- Default: ChatGPT ---
-        else {
+        } else {
           const now = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
           const gpt = await openai.chat.completions.create({
             model: "gpt-4o-mini",
@@ -218,7 +180,6 @@ wss.on("connection", (ws) => {
           reply = gpt.choices[0].message.content.trim();
         }
 
-        // Save conversation
         conversation.push({ role: "user", content: userText });
         conversation.push({ role: "assistant", content: reply });
         if (conversation.length > MAX_HISTORY * 2)
@@ -227,12 +188,13 @@ wss.on("connection", (ws) => {
 
         console.log("🤖 Reply:", reply);
 
-        // === Speak reply ===
+        // Send TTS via URL mode
         await speak(ws, reply);
       }
+
     } catch (err) {
       console.error("❌ Error:", err);
-      ws.send("ERROR");
+      ws.send(JSON.stringify({ type: "error", msg: err.message }));
     }
   });
 
@@ -240,6 +202,4 @@ wss.on("connection", (ws) => {
 });
 
 // === START SERVER ===
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
