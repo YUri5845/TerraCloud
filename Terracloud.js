@@ -17,13 +17,15 @@ app.get("/", (req, res) => {
   res.send("✅ TerraCloud WebSocket server is live!");
 });
 
-const wss = new WebSocket.Server({ server });
+// Disable compression (important for binary audio)
+const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 console.log(`✅ WebSocket server initialized (port: ${PORT})`);
 
 let conversation = [];
 const MAX_HISTORY = 5;
 const CONVO_FILE = "conversation.json";
 
+// Load previous messages
 if (fs.existsSync(CONVO_FILE)) {
   try {
     conversation = JSON.parse(fs.readFileSync(CONVO_FILE, "utf-8"));
@@ -33,16 +35,33 @@ if (fs.existsSync(CONVO_FILE)) {
   }
 }
 
-// === Send audio in chunks with pacing ===
-async function sendInChunks(ws, buffer, chunkSize = 4096, delayMs = 10) {
+// === Reliable WebSocket Send Helper ===
+function wsSendAsync(ws, data, options = {}) {
+  return new Promise((resolve, reject) => {
+    ws.send(data, options, (err) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+// === Send audio in chunks (safe + paced) ===
+async function sendInChunks(ws, buffer, chunkSize = 4096, delayMs = 15) {
   console.log("🔊 Sending audio in chunks...");
+  let totalSent = 0;
+
   for (let i = 0; i < buffer.length; i += chunkSize) {
     const chunk = buffer.slice(i, i + chunkSize);
-    ws.send(chunk, { binary: true });
-    await new Promise((r) => setTimeout(r, delayMs)); // give ESP32 time to flush
+    await wsSendAsync(ws, chunk, { binary: true });
+    totalSent += chunk.length;
+    await new Promise((r) => setTimeout(r, delayMs)); // allow ESP32 to flush
   }
-  ws.send(JSON.stringify({ type: "audio_end" }));
-console.log("✅ Finished sending MP3 data");
+
+  // Wait a bit before signaling end
+  await new Promise((r) => setTimeout(r, 100));
+  await wsSendAsync(ws, JSON.stringify({ type: "audio_end" }));
+
+  console.log(`✅ Finished sending MP3 data (Total: ${totalSent} bytes)`);
 }
 
 // === Text-to-Speech (TTS) ===
@@ -54,8 +73,12 @@ async function speak(ws, text) {
       input: text,
       format: "mp3"
     });
+
     const buffer = Buffer.from(await ttsResponse.arrayBuffer());
+    console.log(`🎵 Generated TTS audio (${buffer.length} bytes)`);
+
     await sendInChunks(ws, buffer);
+
   } catch (err) {
     console.error("❌ TTS error:", err);
   }
@@ -110,7 +133,7 @@ wss.on("connection", (ws) => {
 
   ws.on("message", async (data, isBinary) => {
     try {
-      // === Binary (Audio) ===
+      // === Binary (Audio Upload) ===
       if (isBinary) {
         if (writeStream) writeStream.write(data);
         return;
@@ -139,10 +162,10 @@ wss.on("connection", (ws) => {
         if (writeStream) writeStream.end();
         console.log("🎧 Audio upload complete");
 
-        // 🔊 Tell ESP we’re processing
+        // Tell ESP32 we’re processing
         ws.send("PROCESSING");
 
-        // === Whisper Transcription ===
+        // === Transcribe audio ===
         const transcription = await openai.audio.transcriptions.create({
           file: fs.createReadStream("audio.wav"),
           model: "whisper-1",
@@ -195,7 +218,7 @@ wss.on("connection", (ws) => {
           reply = gpt.choices[0].message.content.trim();
         }
 
-        // Save convo
+        // Save conversation
         conversation.push({ role: "user", content: userText });
         conversation.push({ role: "assistant", content: reply });
         if (conversation.length > MAX_HISTORY * 2)
@@ -204,10 +227,8 @@ wss.on("connection", (ws) => {
 
         console.log("🤖 Reply:", reply);
 
-        // Send TTS response
+        // === Speak reply ===
         await speak(ws, reply);
-
-        ws.send("DONE"); // ✅ signal ESP that everything finished
       }
     } catch (err) {
       console.error("❌ Error:", err);
@@ -222,4 +243,3 @@ wss.on("connection", (ws) => {
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-
