@@ -3,23 +3,22 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const fs = require("fs");
-const fetch = (...args) =>
-  import("node-fetch").then(({ default: fetch }) => fetch(...args));
+const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 const OpenAI = require("openai");
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// === EXPRESS SERVER ===
+// === EXPRESS + WEBSOCKET SERVER (Render HTTPS auto-handles SSL) ===
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-// Simple homepage (optional but useful for Render health check)
+// ✅ Health check route for Render
 app.get("/", (req, res) => {
-  res.send("✅ TerraCloud WebSocket server is running.");
+  res.send("✅ TerraCloud WebSocket server is live and ready!");
 });
 
-// === WEBSOCKET SERVER ===
+// === WEBSOCKET SERVER (handles wss://terracloud.onrender.com) ===
 const wss = new WebSocket.Server({ server });
 console.log(`✅ WebSocket server initialized (port: ${PORT})`);
 
@@ -28,21 +27,22 @@ let conversation = [];
 const MAX_HISTORY = 5;
 const CONVO_FILE = "conversation.json";
 
-// Load saved conversation if exists
+// === Load previous conversation ===
 if (fs.existsSync(CONVO_FILE)) {
   try {
     conversation = JSON.parse(fs.readFileSync(CONVO_FILE, "utf-8"));
-    console.log("💾 Loaded previous conversation:", conversation.length, "messages");
+    console.log(`💾 Loaded ${conversation.length} previous messages`);
   } catch (err) {
-    console.error("⚠️ Failed to load conversation file:", err);
+    console.error("⚠️ Failed to load conversation:", err);
   }
 }
 
+// === Send TTS audio in chunks ===
 function sendInChunks(ws, buffer, chunkSize = 4096) {
   for (let i = 0; i < buffer.length; i += chunkSize) {
     ws.send(buffer.slice(i, i + chunkSize));
   }
-  console.log("✅ TTS audio sent in chunks");
+  console.log("🔊 Sent TTS audio in chunks");
 }
 
 async function speak(ws, text) {
@@ -59,12 +59,12 @@ async function speak(ws, text) {
   }
 }
 
-// ====== NEWS FUNCTION ======
+// === Fetch Latest News ===
 async function getLatestNews(isTagalog = false, topic = "") {
   try {
-    const newsKey = process.env.NEWSDATA_API_KEY;
-    const baseUrl = `https://newsdata.io/api/1/news?country=ph&language=en&apikey=${newsKey}`;
-    const url = topic ? `${baseUrl}&q=${encodeURIComponent(topic)}` : baseUrl;
+    const key = process.env.NEWSDATA_API_KEY;
+    const base = `https://newsdata.io/api/1/news?country=ph&language=en&apikey=${key}`;
+    const url = topic ? `${base}&q=${encodeURIComponent(topic)}` : base;
 
     const response = await fetch(url);
     const data = await response.json();
@@ -82,56 +82,26 @@ async function getLatestNews(isTagalog = false, topic = "") {
     const summary = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You summarize the latest news naturally and conversationally." },
+        { role: "system", content: "You summarize news naturally and conversationally." },
         { role: "user", content: summaryPrompt },
       ],
     });
 
-    const summarizedNews = summary.choices[0].message.content.trim();
-
     return isTagalog
-      ? `📰 Narito ang mga pinakabagong balita sa ${topic || "Pilipinas"}: ${summarizedNews}`
-      : `📰 Here’s the latest ${topic || "Philippine"} news: ${summarizedNews}`;
+      ? `📰 Narito ang mga pinakabagong balita sa ${topic || "Pilipinas"}: ${summary.choices[0].message.content.trim()}`
+      : `📰 Here’s the latest ${topic || "Philippine"} news: ${summary.choices[0].message.content.trim()}`;
   } catch (err) {
     console.error("📰 News API error:", err);
     return "⚠️ Sorry, I had trouble getting the news.";
   }
 }
 
-// ====== WEBSOCKET CONNECTIONS ======
-wss.on("connection", ws => {
+// === WebSocket Handling ===
+wss.on("connection", (ws) => {
   console.log("🔗 ESP32 connected");
 
   ws.assistantVoice = "alloy";
   ws.assistantPrompt = "You are a helpful AI assistant.";
-
-  const waitForConfig = new Promise(resolve => {
-    const timeout = setTimeout(resolve, 2000);
-    ws.once("message", msg => {
-      try {
-        const parsed = JSON.parse(msg.toString());
-        if (parsed.cmd === "SET_CONFIG") {
-          ws.assistantVoice = parsed.voice || "alloy";
-          ws.assistantPrompt = parsed.prompt || "You are a helpful AI assistant.";
-          console.log(`⚙️ Config received: voice=${ws.assistantVoice}`);
-        }
-      } catch (_) {}
-      clearTimeout(timeout);
-      resolve();
-    });
-  });
-
-  waitForConfig.then(async () => {
-    const greetings = [
-      "Hey, kamusta ka?",
-      "Yo! Need any help?",
-      "What’s up? na miss mo ba 'ko?",
-      "Hey there! What can I do for you today?",
-    ];
-    const randomGreeting = greetings[Math.floor(Math.random() * greetings.length)];
-    console.log(`💬 Greeting with voice=${ws.assistantVoice}`);
-    await speak(ws, randomGreeting);
-  });
 
   ws.on("message", async (data, isBinary) => {
     try {
@@ -141,15 +111,14 @@ wss.on("connection", ws => {
       }
 
       const msg = data.toString();
-      if (msg.startsWith("{") && msg.includes("SET_CONFIG")) return;
-
       if (msg === "START") {
-        console.log("🎬 Start receiving audio...");
         writeStream = fs.createWriteStream("audio.wav");
+        console.log("🎙️ Receiving audio...");
         return;
-      } else if (msg === "END") {
-        console.log("🏁 Audio stream ended");
+      }
+      if (msg === "END") {
         if (writeStream) writeStream.end();
+        console.log("🎧 Audio capture done");
 
         const transcription = await openai.audio.transcriptions.create({
           file: fs.createReadStream("audio.wav"),
@@ -157,109 +126,53 @@ wss.on("connection", ws => {
         });
 
         const userText = transcription.text.trim();
-        console.log("📩 Transcribed:", userText);
+        console.log("📥 Transcribed:", userText);
         ws.send(JSON.stringify({ type: "transcript", text: userText }));
 
-        const lowerText = userText.toLowerCase();
         let reply = "";
+        const lower = userText.toLowerCase();
 
-        // Weather
-        if (lowerText.includes("weather") || lowerText.includes("panahon")) {
-          const cityMatch = lowerText.match(/(?:in|sa)\s+([a-zA-Z\s]+)/);
+        // 🧠 Simple Intent Detection
+        if (lower.includes("weather") || lower.includes("panahon")) {
+          const cityMatch = lower.match(/(?:in|sa)\s+([a-zA-Z\s]+)/);
           const city = cityMatch ? cityMatch[1].trim() : "Manila";
-          const weatherKey = process.env.WEATHER_API_KEY;
-
+          const key = process.env.WEATHER_API_KEY;
           try {
-            const weatherRes = await fetch(
-              `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&units=metric&appid=${weatherKey}`
-            );
-            const weatherData = await weatherRes.json();
-
-            if (weatherData.cod === 200) {
-              const desc = weatherData.weather[0].description;
-              const temp = weatherData.main.temp;
-              const isTagalog = lowerText.includes("panahon");
-              reply = isTagalog
+            const res = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&units=metric&appid=${key}`);
+            const json = await res.json();
+            if (json.cod === 200) {
+              const desc = json.weather[0].description;
+              const temp = json.main.temp;
+              reply = lower.includes("panahon")
                 ? `Ang panahon sa ${city} ay ${temp}°C, ${desc}.`
                 : `The weather in ${city} is ${desc} with a temperature of ${temp}°C.`;
             } else reply = "⚠️ City not found.";
           } catch {
             reply = "⚠️ Error getting weather data.";
           }
-        }
-
-        // News
-        else if (lowerText.includes("news") || lowerText.includes("balita")) {
-          const isTagalog = lowerText.includes("balita");
-          let topic = "";
-
-          if (lowerText.includes("tech")) topic = "technology";
-          else if (lowerText.includes("sports")) topic = "sports";
-          else if (lowerText.includes("business")) topic = "business";
-          else if (lowerText.includes("entertainment")) topic = "entertainment";
-          else if (lowerText.includes("politics")) topic = "politics";
-          else if (lowerText.includes("teknolohiya")) topic = "technology";
-          else if (lowerText.includes("isports") || lowerText.includes("palakasan")) topic = "sports";
-          else if (lowerText.includes("negosyo")) topic = "business";
-          else if (lowerText.includes("aliwan") || lowerText.includes("libangan")) topic = "entertainment";
-          else if (lowerText.includes("politika")) topic = "politics";
-          else if (lowerText.includes("pangkalahatan") || lowerText.includes("lahat")) topic = "";
-
-          reply = topic
-            ? await getLatestNews(isTagalog, topic)
-            : isTagalog
-              ? "Anong klaseng balita ang gusto mong marinig — teknolohiya, isports, negosyo, politika, aliwan, o pangkalahatan?"
-              : "What kind of news would you like — technology, sports, business, politics, entertainment, or general?";
-        }
-
-        // Time awareness
-        else if (
-          lowerText.includes("time") ||
-          lowerText.includes("oras") ||
-          lowerText.includes("date") ||
-          lowerText.includes("araw")
-        ) {
-          const now = new Date();
-          const phTime = now.toLocaleTimeString("en-PH", { timeZone: "Asia/Manila", hour: "2-digit", minute: "2-digit" });
-          const phDate = now.toLocaleDateString("en-PH", {
-            timeZone: "Asia/Manila",
-            weekday: "long",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-          });
-
-          const isTagalog = lowerText.includes("oras") || lowerText.includes("araw");
-          reply = isTagalog
-            ? `Ngayon ay ${phDate}, at ang oras ay ${phTime}.`
-            : `It's ${phDate}, and the time is ${phTime}.`;
-        }
-
-        // Chat
-        else {
-          const now = new Date();
-          const timeString = now.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
-          const gptResponse = await openai.chat.completions.create({
+        } else if (lower.includes("news") || lower.includes("balita")) {
+          const isTagalog = lower.includes("balita");
+          const topics = { tech: "technology", sports: "sports", business: "business", entertainment: "entertainment", politics: "politics" };
+          const found = Object.entries(topics).find(([key, val]) => lower.includes(key) || lower.includes(val));
+          reply = await getLatestNews(isTagalog, found ? found[1] : "");
+        } else {
+          const now = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+          const gpt = await openai.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
-              {
-                role: "system",
-                content: `${ws.assistantPrompt}\n\nCurrent date and time: ${timeString} (Philippine local time).`,
-              },
+              { role: "system", content: `${ws.assistantPrompt}\nCurrent date/time: ${now}` },
               ...conversation,
               { role: "user", content: userText },
             ],
           });
-          reply = gptResponse.choices[0].message.content;
+          reply = gpt.choices[0].message.content;
         }
 
-        // Maintain conversation history
         conversation.push({ role: "user", content: userText });
         conversation.push({ role: "assistant", content: reply });
-        if (conversation.length > MAX_HISTORY * 2)
-          conversation = conversation.slice(-MAX_HISTORY * 2);
-
+        if (conversation.length > MAX_HISTORY * 2) conversation = conversation.slice(-MAX_HISTORY * 2);
         fs.writeFileSync(CONVO_FILE, JSON.stringify(conversation, null, 2));
+
         console.log("🤖 Reply:", reply);
         await speak(ws, reply);
       }
